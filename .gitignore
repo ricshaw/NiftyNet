@@ -28,3 +28,4 @@ doc/source/niftynet*
 doc/source/modules.rst
 .vscode/
 .ipynb_checkpoints
+venv/

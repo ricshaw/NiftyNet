@@ -1,0 +1,24 @@
+# train
+python net_run.py train -a niftynet.contrib.segmentation_selective_sampler.ss_app.SelectiveSampling -c ./config/my_multimodal_segmentation_augmented_3.ini
+
+python net_run.py train -a niftynet.contrib.segmentation_selective_sampler.ss_app.SelectiveSampling -c ./config/my_multimodal_segmentation_with_small_artefacts.ini
+
+python net_run.py train -a niftynet.application.classification_application.ClassificationApplication -c ./config/classify_newsplit1.ini
+
+python net_run.py train -a niftynet.application.segmentation_application.SegmentationApplication -c ./config/adni_clean_seg.ini
+
+python net_run.py train -a niftynet.contrib.segmentation_selective_sampler.ss_app.SelectiveSampling -c ./config/adni_clean_seg.ini
+
+python net_run.py train -a niftynet.contrib.segmentation_selective_sampler.ss_app.SelectiveSampling -c ./config/adni_clean_seg_weighted.ini
+
+python net_run.py train -a niftynet.contrib.segmentation_selective_sampler.ss_app.SelectiveSampling -c ./config/adni_clean_seg_weighted.ini
+
+python net_run.py train -a niftynet.application.classification_application_multioutput.ClassificationApplication -c ./config/classify_multioutput_meanpool_fold1.ini
+
+
+# test
+net_segment inference -c ./config/my_multimodal_segmentation_augmented_3.ini
+
+
+# eval
+python net_run.py evaluation -a niftynet.application.segmentation_application.SegmentationApplication -c ./config/Eval/adni_clean_seg_eval.ini
