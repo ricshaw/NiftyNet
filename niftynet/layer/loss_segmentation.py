@@ -36,7 +36,9 @@ class LossFunction(Layer):
         self._loss_func_params = \
             loss_func_params if loss_func_params is not None else dict()
 
-        if self._data_loss_func.__name__.startswith('cross_entropy'):
+        data_loss_function_name = self._data_loss_func.__name__
+        if data_loss_function_name.startswith('cross_entropy') \
+                or 'xent' in data_loss_function_name:
             tf.logging.info(
                 'Cross entropy loss function calls '
                 'tf.nn.sparse_softmax_cross_entropy_with_logits '
@@ -70,11 +72,22 @@ class LossFunction(Layer):
 
             data_loss = []
             for ind, pred in enumerate(prediction):
-                # go through each scale
 
-                loss_batch = []
-                for b_ind, pred_b in enumerate(tf.unstack(pred, axis=0)):
-                    # go through each image in a batch
+                # go through each scale
+                def _batch_i_loss(*args):
+                    """
+                    loss for the `b_id`-th batch (over spatial dimensions)
+
+                    :param b_id:
+                    :return:
+                    """
+                    # unpacking input from map_fn elements
+                    if len(args[0]) == 2:
+                        # pred and ground_truth
+                        pred_b, ground_truth_b = args[0]
+                        weight_b = None
+                    else:
+                        pred_b, ground_truth_b, weight_b = args[0]
 
                     pred_b = tf.reshape(pred_b, [-1, self._num_classes])
                     # performs softmax if required
@@ -92,15 +105,14 @@ class LossFunction(Layer):
                     else:
                         ref_shape = pred_b.shape.as_list()[:-1] + [-1]
 
-                    ground_truth_b = tf.reshape(ground_truth[b_ind], ref_shape)
+                    ground_truth_b = tf.reshape(ground_truth_b, ref_shape)
                     if ground_truth_b.shape.as_list()[-1] == 1:
                         ground_truth_b = tf.squeeze(ground_truth_b, axis=-1)
-                    if weight_map is not None:
-                        weight_b = tf.reshape(weight_map[b_ind], ref_shape)
+
+                    if weight_b is not None:
+                        weight_b = tf.reshape(weight_b, ref_shape)
                         if weight_b.shape.as_list()[-1] == 1:
                             weight_b = tf.squeeze(weight_b, axis=-1)
-                    else:
-                        weight_b = None
 
                     # preparing loss function parameters
                     loss_params = {
@@ -110,8 +122,19 @@ class LossFunction(Layer):
                     if self._loss_func_params:
                         loss_params.update(self._loss_func_params)
 
-                    # loss for each batch over spatial dimensions
-                    loss_batch.append(self._data_loss_func(**loss_params))
+                    return tf.to_float(self._data_loss_func(**loss_params))
+
+                if weight_map is not None:
+                    elements = (pred, ground_truth, weight_map)
+                else:
+                    elements = (pred, ground_truth)
+
+                loss_batch = tf.map_fn(
+                    fn=_batch_i_loss,
+                    elems=elements,
+                    dtype=tf.float32,
+                    parallel_iterations=1)
+
                 # loss averaged over batch
                 data_loss.append(tf.reduce_mean(loss_batch))
             # loss averaged over multiple scales
@@ -184,9 +207,11 @@ def generalised_dice_loss(prediction,
     one_hot = labels_to_one_hot(ground_truth, tf.shape(prediction)[-1])
 
     if weight_map is not None:
-        n_classes = prediction.shape[1].value
-        weight_map_nclasses = tf.reshape(
-            tf.tile(weight_map, [n_classes]), prediction.get_shape())
+        num_classes = prediction.shape[1].value
+        # weight_map_nclasses = tf.reshape(
+        #     tf.tile(weight_map, [num_classes]), prediction.get_shape())
+        weight_map_nclasses = tf.tile(
+            tf.expand_dims(tf.reshape(weight_map, [-1]), 1), [1, num_classes])
         ref_vol = tf.sparse_reduce_sum(
             weight_map_nclasses * one_hot, reduction_axes=[0])
 
@@ -213,11 +238,63 @@ def generalised_dice_loss(prediction,
                        tf.reduce_max(new_weights), weights)
     generalised_dice_numerator = \
         2 * tf.reduce_sum(tf.multiply(weights, intersect))
-    generalised_dice_denominator = \
-        tf.reduce_sum(tf.multiply(weights, seg_vol + ref_vol))
+    # generalised_dice_denominator = \
+    #     tf.reduce_sum(tf.multiply(weights, seg_vol + ref_vol)) + 1e-6
+    generalised_dice_denominator = tf.reduce_sum(
+        tf.multiply(weights, tf.maximum(seg_vol + ref_vol, 1)))
     generalised_dice_score = \
         generalised_dice_numerator / generalised_dice_denominator
+    generalised_dice_score = tf.where(tf.is_nan(generalised_dice_score), 1.0,
+                                      generalised_dice_score)
     return 1 - generalised_dice_score
+
+
+def dice_plus_xent_loss(prediction, ground_truth, weight_map=None):
+    """
+    Function to calculate the loss used in https://arxiv.org/pdf/1809.10486.pdf,
+    no-new net, Isenseee et al (used to win the Medical Imaging Decathlon).
+
+    It is the sum of the cross-entropy and the Dice-loss.
+
+    :param prediction: the logits
+    :param ground_truth: the segmentation ground truth
+    :param weight_map:
+    :return: the loss (cross_entropy + Dice)
+
+    """
+    num_classes = tf.shape(prediction)[-1]
+
+    prediction = tf.cast(prediction, tf.float32)
+    loss_xent = cross_entropy(prediction, ground_truth, weight_map=weight_map)
+
+    # Dice as according to the paper:
+    one_hot = labels_to_one_hot(ground_truth, num_classes=num_classes)
+    softmax_of_logits = tf.nn.softmax(prediction)
+
+    if weight_map is not None:
+        weight_map_nclasses = tf.tile(
+            tf.reshape(weight_map, [-1, 1]), [1, num_classes])
+        dice_numerator = 2.0 * tf.sparse_reduce_sum(
+            weight_map_nclasses * one_hot * softmax_of_logits,
+            reduction_axes=[0])
+        dice_denominator = \
+            tf.reduce_sum(weight_map_nclasses * softmax_of_logits,
+                          reduction_indices=[0]) + \
+            tf.sparse_reduce_sum(one_hot * weight_map_nclasses,
+                                 reduction_axes=[0])
+    else:
+        dice_numerator = 2.0 * tf.sparse_reduce_sum(
+            one_hot * softmax_of_logits, reduction_axes=[0])
+        dice_denominator = \
+            tf.reduce_sum(softmax_of_logits, reduction_indices=[0]) + \
+            tf.sparse_reduce_sum(one_hot, reduction_axes=[0])
+
+    epsilon = 0.00001
+    loss_dice = -(dice_numerator + epsilon) / (dice_denominator + epsilon)
+    dice_numerator = tf.Print(
+        dice_denominator, [dice_numerator, dice_denominator, loss_dice])
+
+    return loss_dice + loss_xent
 
 
 def sensitivity_specificity_loss(prediction,
@@ -251,15 +328,15 @@ def sensitivity_specificity_loss(prediction,
     one_cold = 1 - one_hot
 
     # chosen region may contain no voxels of a given label. Prevents nans.
-    epsilon_denominator = 1e-5
+    epsilon = 1e-5
 
     squared_error = tf.square(one_hot - prediction)
     specificity_part = tf.reduce_sum(
         squared_error * one_hot, 0) / \
-                       (tf.reduce_sum(one_hot, 0) + epsilon_denominator)
+                       (tf.reduce_sum(one_hot, 0) + epsilon)
     sensitivity_part = \
         (tf.reduce_sum(tf.multiply(squared_error, one_cold), 0) /
-         (tf.reduce_sum(one_cold, 0) + epsilon_denominator))
+         (tf.reduce_sum(one_cold, 0) + epsilon))
 
     return tf.reduce_sum(r * specificity_part + (1 - r) * sensitivity_part)
 
@@ -275,13 +352,18 @@ def cross_entropy(prediction, ground_truth, weight_map=None):
     """
     if len(ground_truth.shape) == len(prediction.shape):
         ground_truth = ground_truth[..., -1]
+
+    # TODO trace this back:
+    ground_truth = tf.cast(ground_truth, tf.int32)
+
     entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
         logits=prediction, labels=ground_truth)
-    if weight_map is not None:
-        weight_map = tf.cast(tf.size(entropy), dtype=tf.float32) / \
-                     tf.reduce_sum(weight_map) * weight_map
-        entropy = tf.multiply(entropy, weight_map)
-    return tf.reduce_mean(entropy)
+
+    if weight_map is None:
+        return tf.reduce_mean(entropy)
+
+    weight_sum = tf.maximum(tf.reduce_sum(weight_map), 1e-6)
+    return tf.reduce_sum(entropy * weight_map / weight_sum)
 
 
 def cross_entropy_dense(prediction, ground_truth, weight_map=None):
@@ -312,7 +394,7 @@ def wasserstein_disagreement_map(
     assert M is not None, "Distance matrix is required."
     # pixel-wise Wassertein distance (W) between flat_pred_proba and flat_labels
     # wrt the distance matrix on the label space M
-    n_classes = prediction.shape[1].value
+    num_classes = prediction.shape[1].value
     ground_truth.set_shape(prediction.shape)
     unstack_labels = tf.unstack(ground_truth, axis=-1)
     unstack_labels = tf.cast(unstack_labels, dtype=tf.float64)
@@ -322,8 +404,8 @@ def wasserstein_disagreement_map(
     #       "unstacked pred" ,unstack_pred)
     # W is a weighting sum of all pairwise correlations (pred_ci x labels_cj)
     pairwise_correlations = []
-    for i in range(n_classes):
-        for j in range(n_classes):
+    for i in range(num_classes):
+        for j in range(num_classes):
             pairwise_correlations.append(
                 M[i, j] * tf.multiply(unstack_pred[i], unstack_labels[j]))
     wass_dis_map = tf.add_n(pairwise_correlations)
@@ -350,7 +432,7 @@ def generalised_wasserstein_dice_loss(prediction,
         tf.logging.warning('Weight map specified but not used.')
 
     prediction = tf.cast(prediction, tf.float32)
-    n_classes = prediction.shape[1].value
+    num_classes = prediction.shape[1].value
     one_hot = labels_to_one_hot(ground_truth, tf.shape(prediction)[-1])
 
     one_hot = tf.sparse_tensor_to_dense(one_hot)
@@ -363,7 +445,7 @@ def generalised_wasserstein_dice_loss(prediction,
     # compute generalisation of true positives for multi-class seg
     one_hot = tf.cast(one_hot, dtype=tf.float64)
     true_pos = tf.reduce_sum(
-        tf.multiply(tf.constant(M[0, :n_classes], dtype=tf.float64), one_hot),
+        tf.multiply(tf.constant(M[0, :num_classes], dtype=tf.float64), one_hot),
         axis=1)
     true_pos = tf.reduce_sum(tf.multiply(true_pos, 1. - delta), axis=0)
     WGDL = 1. - (2. * true_pos) / (2. * true_pos + all_error)
@@ -391,9 +473,9 @@ def dice(prediction, ground_truth, weight_map=None):
     one_hot = labels_to_one_hot(ground_truth, tf.shape(prediction)[-1])
 
     if weight_map is not None:
-        n_classes = prediction.shape[1].value
-        weight_map_nclasses = tf.reshape(
-            tf.tile(weight_map, [n_classes]), prediction.get_shape())
+        num_classes = prediction.shape[1].value
+        weight_map_nclasses = tf.tile(tf.expand_dims(
+            tf.reshape(weight_map, [-1]), 1), [1, num_classes])
         dice_numerator = 2.0 * tf.sparse_reduce_sum(
             weight_map_nclasses * one_hot * prediction, reduction_axes=[0])
         dice_denominator = \
@@ -407,10 +489,10 @@ def dice(prediction, ground_truth, weight_map=None):
         dice_denominator = \
             tf.reduce_sum(tf.square(prediction), reduction_indices=[0]) + \
             tf.sparse_reduce_sum(one_hot, reduction_axes=[0])
-    epsilon_denominator = 0.00001
+    epsilon = 0.00001
 
-    dice_score = dice_numerator / (dice_denominator + epsilon_denominator)
-    # dice_score.set_shape([n_classes])
+    dice_score = (dice_numerator + epsilon) / (dice_denominator + epsilon)
+    # dice_score.set_shape([num_classes])
     # minimising (1 - dice_coefficients)
     return 1.0 - tf.reduce_mean(dice_score)
 
@@ -431,9 +513,9 @@ def dice_nosquare(prediction, ground_truth, weight_map=None):
 
     # dice
     if weight_map is not None:
-        n_classes = prediction.shape[1].value
-        weight_map_nclasses = tf.reshape(
-            tf.tile(weight_map, [n_classes]), prediction.get_shape())
+        num_classes = prediction.shape[1].value
+        weight_map_nclasses = tf.tile(tf.expand_dims(
+            tf.reshape(weight_map, [-1]), 1), [1, num_classes])
         dice_numerator = 2.0 * tf.sparse_reduce_sum(
             weight_map_nclasses * one_hot * prediction, reduction_axes=[0])
         dice_denominator = \
@@ -446,12 +528,58 @@ def dice_nosquare(prediction, ground_truth, weight_map=None):
                                                     reduction_axes=[0])
         dice_denominator = tf.reduce_sum(prediction, reduction_indices=[0]) + \
                            tf.sparse_reduce_sum(one_hot, reduction_axes=[0])
-    epsilon_denominator = 0.00001
+    epsilon = 0.00001
 
-    dice_score = dice_numerator / (dice_denominator + epsilon_denominator)
-    # dice_score.set_shape([n_classes])
+    dice_score = (dice_numerator + epsilon) / (dice_denominator + epsilon)
+    # dice_score.set_shape([num_classes])
     # minimising (1 - dice_coefficients)
     return 1.0 - tf.reduce_mean(dice_score)
+
+
+def tversky(prediction, ground_truth, weight_map=None, alpha=0.5, beta=0.5):
+    """
+    Function to calculate the Tversky loss for imbalanced data
+
+        Sadegh et al. (2017)
+
+        Tversky loss function for image segmentation
+        using 3D fully convolutional deep networks
+
+    :param prediction: the logits
+    :param ground_truth: the segmentation ground_truth
+    :param alpha: weight of false positives
+    :param beta: weight of false negatives
+    :param weight_map:
+    :return: the loss
+    """
+    prediction = tf.to_float(prediction)
+    if len(ground_truth.shape) == len(prediction.shape):
+        ground_truth = ground_truth[..., -1]
+    one_hot = labels_to_one_hot(ground_truth, tf.shape(prediction)[-1])
+    one_hot = tf.sparse_tensor_to_dense(one_hot)
+
+    p0 = prediction
+    p1 = 1 - prediction
+    g0 = one_hot
+    g1 = 1 - one_hot
+
+    if weight_map is not None:
+        num_classes = prediction.shape[1].value
+        weight_map_flattened = tf.reshape(weight_map, [-1])
+        weight_map_expanded = tf.expand_dims(weight_map_flattened, 1)
+        weight_map_nclasses = tf.tile(weight_map_expanded, [1, num_classes])
+    else:
+        weight_map_nclasses = 1
+
+    tp = tf.reduce_sum(weight_map_nclasses * p0 * g0)
+    fp = alpha * tf.reduce_sum(weight_map_nclasses * p0 * g1)
+    fn = beta * tf.reduce_sum(weight_map_nclasses * p1 * g0)
+
+    EPSILON = 0.00001
+    numerator = tp
+    denominator = tp + fp + fn + EPSILON
+    score = numerator / denominator
+    return 1.0 - tf.reduce_mean(score)
 
 
 def dice_dense(prediction, ground_truth, weight_map=None):
@@ -477,9 +605,10 @@ def dice_dense(prediction, ground_truth, weight_map=None):
     dice_denominator = \
         tf.reduce_sum(tf.square(prediction), axis=reduce_axes) + \
         tf.reduce_sum(tf.square(ground_truth), axis=reduce_axes)
-    epsilon_denominator = 0.00001
 
-    dice_score = dice_numerator / (dice_denominator + epsilon_denominator)
+    epsilon = 0.00001
+
+    dice_score = (dice_numerator + epsilon) / (dice_denominator + epsilon)
     return 1.0 - tf.reduce_mean(dice_score)
 
 
@@ -506,7 +635,7 @@ def dice_dense_nosquare(prediction, ground_truth, weight_map=None):
     dice_denominator = \
         tf.reduce_sum(prediction, axis=reduce_axes) + \
         tf.reduce_sum(ground_truth, axis=reduce_axes)
-    epsilon_denominator = 0.00001
+    epsilon = 0.00001
 
-    dice_score = dice_numerator / (dice_denominator + epsilon_denominator)
+    dice_score = (dice_numerator + epsilon) / (dice_denominator + epsilon)
     return 1.0 - tf.reduce_mean(dice_score)
